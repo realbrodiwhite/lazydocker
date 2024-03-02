@@ -1,7 +1,7 @@
 //go:build windows
 // +build windows
 
-// Copyright 2022 The TCell Authors
+// Copyright 2024 The TCell Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use file except in compliance with the License.
@@ -33,12 +33,10 @@ type cScreen struct {
 	out        syscall.Handle
 	cancelflag syscall.Handle
 	scandone   chan struct{}
-	evch       chan Event
 	quit       chan struct{}
 	curx       int
 	cury       int
 	style      Style
-	clear      bool
 	fini       bool
 	vten       bool
 	truecolor  bool
@@ -53,12 +51,13 @@ type cScreen struct {
 	oimode      uint32
 	oomode      uint32
 	cells       CellBuffer
-
-	finiOnce sync.Once
+	focusEnable bool
 
 	mouseEnabled bool
 	wg           sync.WaitGroup
+	eventQ       chan Event
 	stopQ        chan struct{}
+	finiOnce     sync.Once
 
 	sync.Mutex
 }
@@ -147,7 +146,7 @@ const (
 	vtSgr0                    = "\x1b[0m"
 	vtBold                    = "\x1b[1m"
 	vtUnderline               = "\x1b[4m"
-	vtBlink                   = "\x1b[5m" // Not sure this is processed
+	vtBlink                   = "\x1b[5m" // Not sure if this is processed
 	vtReverse                 = "\x1b[7m"
 	vtSetFg                   = "\x1b[38;5;%dm"
 	vtSetBg                   = "\x1b[48;5;%dm"
@@ -176,11 +175,11 @@ var vtCursorStyles = map[CursorStyle]string{
 // with the current process.  The Screen makes use of the Windows Console
 // API to display content and read events.
 func NewConsoleScreen() (Screen, error) {
-	return &cScreen{}, nil
+	return &baseScreen{screenImpl: &cScreen{}}, nil
 }
 
 func (s *cScreen) Init() error {
-	s.evch = make(chan Event, 10)
+	s.eventQ = make(chan Event, 10)
 	s.quit = make(chan struct{})
 	s.scandone = make(chan struct{})
 
@@ -231,7 +230,7 @@ func (s *cScreen) Init() error {
 	// 24-bit color is opt-in for now, because we can't figure out
 	// to make it work consistently.
 	if s.truecolor {
-		s.setOutMode(modeVtOutput | modeNoAutoNL | modeCookedOut)
+		s.setOutMode(modeVtOutput | modeNoAutoNL | modeCookedOut | modeUnderline)
 		var om uint32
 		s.getOutMode(&om)
 		if om&modeVtOutput == modeVtOutput {
@@ -282,8 +281,23 @@ func (s *cScreen) EnablePaste() {}
 
 func (s *cScreen) DisablePaste() {}
 
+func (s *cScreen) EnableFocus() {
+	s.Lock()
+	s.focusEnable = true
+	s.Unlock()
+}
+
+func (s *cScreen) DisableFocus() {
+	s.Lock()
+	s.focusEnable = false
+	s.Unlock()
+}
+
 func (s *cScreen) Fini() {
-	s.disengage()
+	s.finiOnce.Do(func() {
+		close(s.quit)
+		s.disengage()
+	})
 }
 
 func (s *cScreen) disengage() {
@@ -334,7 +348,7 @@ func (s *cScreen) engage() error {
 	s.enableMouse(s.mouseEnabled)
 
 	if s.vten {
-		s.setOutMode(modeVtOutput | modeNoAutoNL | modeCookedOut)
+		s.setOutMode(modeVtOutput | modeNoAutoNL | modeCookedOut | modeUnderline)
 	} else {
 		s.setOutMode(0)
 	}
@@ -351,52 +365,6 @@ func (s *cScreen) engage() error {
 	s.wg.Add(1)
 	go s.scanInput(s.stopQ)
 	return nil
-}
-
-func (s *cScreen) PostEventWait(ev Event) {
-	s.evch <- ev
-}
-
-func (s *cScreen) PostEvent(ev Event) error {
-	select {
-	case s.evch <- ev:
-		return nil
-	default:
-		return ErrEventQFull
-	}
-}
-
-func (s *cScreen) ChannelEvents(ch chan<- Event, quit <-chan struct{}) {
-	defer close(ch)
-	for {
-		select {
-		case <-quit:
-			return
-		case <-s.stopQ:
-			return
-		case ev := <-s.evch:
-			select {
-			case <-quit:
-				return
-			case <-s.stopQ:
-				return
-			case ch <- ev:
-			}
-		}
-	}
-}
-
-func (s *cScreen) PollEvent() Event {
-	select {
-	case <-s.stopQ:
-		return nil
-	case ev := <-s.evch:
-		return ev
-	}
-}
-
-func (s *cScreen) HasPendingEvent() bool {
-	return len(s.evch) > 0
 }
 
 type cursorInfo struct {
@@ -489,8 +457,8 @@ const (
 	keyEvent    uint16 = 1
 	mouseEvent  uint16 = 2
 	resizeEvent uint16 = 4
-	// menuEvent   uint16 = 8  // don't use
-	// focusEvent  uint16 = 16 // don't use
+	menuEvent   uint16 = 8 // don't use
+	focusEvent  uint16 = 16
 )
 
 type mouseRecord struct {
@@ -499,6 +467,10 @@ type mouseRecord struct {
 	btns  uint32
 	mod   uint32
 	flags uint32
+}
+
+type focusRecord struct {
+	focused int32 // actually BOOL
 }
 
 const (
@@ -640,12 +612,17 @@ func geti16(v []byte) int16 {
 func mod2mask(cks uint32) ModMask {
 	mm := ModNone
 	// Left or right control
-	if (cks & (0x0008 | 0x0004)) != 0 {
-		mm |= ModCtrl
-	}
+	ctrl := (cks & (0x0008 | 0x0004)) != 0
 	// Left or right alt
-	if (cks & (0x0002 | 0x0001)) != 0 {
-		mm |= ModAlt
+	alt := (cks & (0x0002 | 0x0001)) != 0
+	// Filter out ctrl+alt (it means AltGr)
+	if !(ctrl && alt) {
+		if ctrl {
+			mm |= ModCtrl
+		}
+		if alt {
+			mm |= ModAlt
+		}
 	}
 	// Any shift
 	if (cks & 0x0010) != 0 {
@@ -698,6 +675,13 @@ func mrec2btns(mbtns, flags uint32) ButtonMask {
 	return btns
 }
 
+func (s *cScreen) postEvent(ev Event) {
+	select {
+	case s.eventQ <- ev:
+	case <-s.quit:
+	}
+}
+
 func (s *cScreen) getConsoleInput() error {
 	// cancelFlag comes first as WaitForMultipleObjects returns the lowest index
 	// in the event that both events are signalled.
@@ -740,7 +724,7 @@ func (s *cScreen) getConsoleInput() error {
 			krec.mod = getu32(rec.data[12:])
 
 			if krec.isdown == 0 || krec.repeat < 1 {
-				// its a key release event, ignore it
+				// it's a key release event, ignore it
 				return nil
 			}
 			if krec.ch != 0 {
@@ -748,11 +732,9 @@ func (s *cScreen) getConsoleInput() error {
 				for krec.repeat > 0 {
 					// convert shift+tab to backtab
 					if mod2mask(krec.mod) == ModShift && krec.ch == vkTab {
-						s.PostEventWait(NewEventKey(KeyBacktab, 0,
-							ModNone))
+						s.postEvent(NewEventKey(KeyBacktab, 0, ModNone))
 					} else {
-						s.PostEventWait(NewEventKey(KeyRune, rune(krec.ch),
-							mod2mask(krec.mod)))
+						s.postEvent(NewEventKey(KeyRune, rune(krec.ch), mod2mask(krec.mod)))
 					}
 					krec.repeat--
 				}
@@ -764,8 +746,7 @@ func (s *cScreen) getConsoleInput() error {
 				return nil
 			}
 			for krec.repeat > 0 {
-				s.PostEventWait(NewEventKey(key, rune(krec.ch),
-					mod2mask(krec.mod)))
+				s.postEvent(NewEventKey(key, rune(krec.ch), mod2mask(krec.mod)))
 				krec.repeat--
 			}
 
@@ -778,14 +759,23 @@ func (s *cScreen) getConsoleInput() error {
 			mrec.flags = getu32(rec.data[12:])
 			btns := mrec2btns(mrec.btns, mrec.flags)
 			// we ignore double click, events are delivered normally
-			s.PostEventWait(NewEventMouse(int(mrec.x), int(mrec.y), btns,
-				mod2mask(mrec.mod)))
+			s.postEvent(NewEventMouse(int(mrec.x), int(mrec.y), btns, mod2mask(mrec.mod)))
 
 		case resizeEvent:
 			var rrec resizeRecord
 			rrec.x = geti16(rec.data[0:])
 			rrec.y = geti16(rec.data[2:])
-			s.PostEventWait(NewEventResize(int(rrec.x), int(rrec.y)))
+			s.postEvent(NewEventResize(int(rrec.x), int(rrec.y)))
+
+		case focusEvent:
+			var focus focusRecord
+			focus.focused = geti32(rec.data[0:])
+			s.Lock()
+			enabled := s.focusEnable
+			s.Unlock()
+			if enabled {
+				s.postEvent(NewEventFocus(focus.focused != 0))
+			}
 
 		default:
 		}
@@ -891,29 +881,6 @@ func (s *cScreen) mapStyle(style Style) uint16 {
 	return attr
 }
 
-func (s *cScreen) SetCell(x, y int, style Style, ch ...rune) {
-	if len(ch) > 0 {
-		s.SetContent(x, y, ch[0], ch[1:], style)
-	} else {
-		s.SetContent(x, y, ' ', nil, style)
-	}
-}
-
-func (s *cScreen) SetContent(x, y int, primary rune, combining []rune, style Style) {
-	s.Lock()
-	if !s.fini {
-		s.cells.SetContent(x, y, primary, combining, style)
-	}
-	s.Unlock()
-}
-
-func (s *cScreen) GetContent(x, y int) (rune, []rune, Style, int) {
-	s.Lock()
-	primary, combining, style, width := s.cells.GetContent(x, y)
-	s.Unlock()
-	return primary, combining, style, width
-}
-
 func (s *cScreen) sendVtStyle(style Style) {
 	esc := &strings.Builder{}
 
@@ -968,11 +935,6 @@ func (s *cScreen) writeString(x, y int, style Style, ch []uint16) {
 func (s *cScreen) draw() {
 	// allocate a scratch line bit enough for no combining chars.
 	// if you have combining characters, you may pay for extra allocations.
-	if s.clear {
-		s.clearScreen(s.style, s.vten)
-		s.clear = false
-		s.cells.Invalidate()
-	}
 	buf := make([]uint16, 0, s.w)
 	wcs := buf[:]
 	lstyle := styleInvalid
@@ -1153,20 +1115,10 @@ func (s *cScreen) resize() {
 		uintptr(s.out),
 		uintptr(1),
 		uintptr(unsafe.Pointer(&r)))
-	_ = s.PostEvent(NewEventResize(w, h))
-}
-
-func (s *cScreen) Clear() {
-	s.Fill(' ', s.style)
-}
-
-func (s *cScreen) Fill(r rune, style Style) {
-	s.Lock()
-	if !s.fini {
-		s.cells.Fill(r, style)
-		s.clear = true
+	select {
+	case s.eventQ <- NewEventResize(w, h):
+	default:
 	}
-	s.Unlock()
 }
 
 func (s *cScreen) clearScreen(style Style, vtEnable bool) {
@@ -1213,6 +1165,7 @@ const (
 	modeCookedOut uint32 = 0x0001
 	modeVtOutput         = 0x0004
 	modeNoAutoNL         = 0x0008
+	modeUnderline        = 0x0010 // ENABLE_LVB_GRID_WORLDWIDE, needed for underlines
 	// modeWrapEOL          = 0x0002
 )
 
@@ -1326,4 +1279,20 @@ func (s *cScreen) Suspend() error {
 
 func (s *cScreen) Resume() error {
 	return s.engage()
+}
+
+func (s *cScreen) Tty() (Tty, bool) {
+	return nil, false
+}
+
+func (s *cScreen) GetCells() *CellBuffer {
+	return &s.cells
+}
+
+func (s *cScreen) EventQ() chan Event {
+	return s.eventQ
+}
+
+func (s *cScreen) StopQ() <-chan struct{} {
+	return s.quit
 }
