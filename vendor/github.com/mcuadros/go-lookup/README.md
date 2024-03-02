@@ -1,4 +1,4 @@
-go-lookup [![Build Status](https://travis-ci.org/mcuadros/go-lookup.png?branch=master)](https://travis-ci.org/mcuadros/go-lookup) [![GoDoc](http://godoc.org/github.com/mcuadros/go-lookup?status.png)](http://godoc.org/github.com/mcuadros/go-lookup)
+go-lookup [![Build Status](https://img.shields.io/github/workflow/status/mcuadros/go-lookup/Test.svg)](https://github.com/mcuadros/go-lookup/actions) [![GoDoc](http://godoc.org/github.com/mcuadros/go-lookup?status.png)](https://pkg.go.dev/github.com/mcuadros/go-lookup)
 ==============================
 
 Small library on top of reflect for make lookups to Structs or Maps. Using a very simple DSL you can access to any property, key or value of any value of Go.
@@ -42,6 +42,24 @@ q = "A-Team.Cast[0].Actor"
 value, _ = LookupString(series, q)
 fmt.Println(q, "->", value.Interface())
 // A-Team.Cast[0].Actor -> George Peppard
+```
+
+### Case-insensitive matching
+
+Use the `LookupI` and `LookupStringI` functions to do a case-insensitive match on struct field names and map keys. It will first look for an exact match; if that fails, it will fall back to a more expensive linear search over fields/keys.
+
+```go
+type ExampleStruct struct {
+  SoftwareUpdated bool
+}
+
+i := ExampleStruct{
+  SoftwareUpdated: true,
+}
+
+value, _ := LookupStringI(i, "softwareupdated")
+fmt.Println(value.Interface())
+// Output: true
 ```
 
 License
